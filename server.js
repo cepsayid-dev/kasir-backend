@@ -5,7 +5,7 @@ const { Pool } = require('pg');
 
 const app = express();
 app.use(cors());
-app.use(express.json()); // Agar bisa menerima data JSON dari Flutter
+app.use(express.json()); 
 
 // Setup Koneksi ke PostgreSQL
 const pool = new Pool({
@@ -17,7 +17,7 @@ const pool = new Pool({
 });
 
 pool.connect()
-    .then(() => console.log('✅ Terhubung ke PostgreSQL PostgreSQL Warkop'))
+    .then(() => console.log('✅ Terhubung ke PostgreSQL Warkop Lembong'))
     .catch(err => console.error('❌ Error koneksi DB:', err.stack));
 
 // --- ENDPOINT API DASAR ---
@@ -37,18 +37,13 @@ app.get('/api/menus', async (req, res) => {
     }
 });
 
-// 3. Endpoint untuk Sinkronisasi (Menerima Nota dari Kasir Offline)
+// 3. Endpoint Sinkronisasi Nota Jualan (Bills)
 app.post('/api/sync/bills', async (req, res) => {
-    // Membuka jalur transaksi khusus
     const client = await pool.connect();
-    
     try {
-        await client.query('BEGIN'); // Mulai transaksi
-        
-        // Menerima paket JSON dari Flutter berisi 2 array: bills dan bill_items
+        await client.query('BEGIN'); 
         const { bills, bill_items } = req.body;
 
-        // 1. Simpan atau Update Tabel Bills
         if (bills && bills.length > 0) {
             for (let bill of bills) {
                 await client.query(`
@@ -62,7 +57,6 @@ app.post('/api/sync/bills', async (req, res) => {
             }
         }
 
-        // 2. Simpan atau Update Tabel Bill Items
         if (bill_items && bill_items.length > 0) {
             for (let item of bill_items) {
                 await client.query(`
@@ -78,11 +72,58 @@ app.post('/api/sync/bills', async (req, res) => {
             }
         }
 
-        await client.query('COMMIT'); // Simpan permanen ke DB
-        res.json({ status: 'success', message: 'Data kasir berhasil disinkronkan ke server!' });
+        await client.query('COMMIT'); 
+        res.json({ status: 'success', message: 'Data nota berhasil disinkronkan!' });
     } catch (error) {
-        await client.query('ROLLBACK'); // Batalkan semua jika ada error (Anti-corrupt)
+        await client.query('ROLLBACK'); 
         console.error('Sync Error:', error);
+        res.status(500).json({ status: 'error', message: error.message });
+    } finally {
+        client.release();
+    }
+});
+
+// 4. Endpoint Sinkronisasi Pengeluaran (Expenses)
+app.post('/api/sync/expenses', async (req, res) => {
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+        const { notes, items } = req.body;
+
+        // Simpan Kepala Nota Pengeluaran
+        if (notes && notes.length > 0) {
+            for (let note of notes) {
+                await client.query(`
+                    INSERT INTO expense_notes (id, type, description, amount, status, created_at)
+                    VALUES ($1, $2, $3, $4, $5, $6)
+                    ON CONFLICT (id) DO UPDATE 
+                    SET type = EXCLUDED.type,
+                        description = EXCLUDED.description,
+                        amount = EXCLUDED.amount,
+                        status = EXCLUDED.status
+                `, [note.id, note.type, note.description, note.amount, note.status, note.created_at]);
+            }
+        }
+
+        // Simpan Rincian Item PO Belanja
+        if (items && items.length > 0) {
+            for (let item of items) {
+                await client.query(`
+                    INSERT INTO expense_items (id, note_id, menu_id, menu_name, tracking_mode, qty, price, stock_status)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                    ON CONFLICT (id) DO UPDATE 
+                    SET qty = EXCLUDED.qty,
+                        price = EXCLUDED.price,
+                        stock_status = EXCLUDED.stock_status
+                `, [item.id, item.note_id, item.menu_id, item.menu_name, item.tracking_mode, item.qty, item.price, item.stock_status]);
+            }
+        }
+
+        await client.query('COMMIT');
+        res.json({ status: 'success', message: 'Data pengeluaran berhasil disinkronkan!' });
+    } catch (error) {
+        await client.query('ROLLBACK');
+        console.error('Sync Expense Error:', error);
         res.status(500).json({ status: 'error', message: error.message });
     } finally {
         client.release();
