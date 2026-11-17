@@ -6,6 +6,10 @@ const { Pool } = require('pg');
 const app = express();
 app.use(cors());
 app.use(express.json()); 
+app.use((req, res, next) => {
+    console.log(`📥 [${new Date().toLocaleTimeString()}] ${req.method} ${req.url}`);
+    next();
+});
 
 // Setup Koneksi ke PostgreSQL
 const pool = new Pool({
@@ -36,8 +40,54 @@ app.get('/api/menus', async (req, res) => {
         res.status(500).json({ status: 'error', message: error.message });
     }
 });
+// PUSH: Sinkronisasi Master Menu dari Kasir ke PostgreSQL
+app.post('/api/sync/menus', async (req, res) => {
+    const { menus } = req.body;
+    if (!menus || !Array.isArray(menus)) {
+        return res.status(400).json({ status: 'error', message: 'Data menus tidak valid' });
+    }
 
-// 3. Endpoint Sinkronisasi Nota Jualan (Bills)
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+        for (const m of menus) {
+            await client.query(
+                `INSERT INTO menu_items (id, name, price, tracking_mode, stock_qty, stock_status, category)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7)
+                 ON CONFLICT (id) DO UPDATE SET
+                   name = EXCLUDED.name,
+                   price = EXCLUDED.price,
+                   tracking_mode = EXCLUDED.tracking_mode,
+                   stock_qty = EXCLUDED.stock_qty,
+                   stock_status = EXCLUDED.stock_status,
+                   category = EXCLUDED.category`,
+                [m.id, m.name, m.price, m.tracking_mode, m.stock_qty, m.stock_status, m.category]
+            );
+        }
+        await client.query('COMMIT');
+        res.json({ status: 'success', count: menus.length });
+    } catch (error) {
+        await client.query('ROLLBACK');
+        console.error('Sync Menus Error:', error);
+        res.status(500).json({ status: 'error', message: error.message });
+    } finally {
+        client.release();
+    }
+});
+
+// 3. Mengambil Daftar Pegawai Aktif (Untuk Validasi PIN Shift di Kasir)
+app.get('/api/employees', async (req, res) => {
+    try {
+        const result = await pool.query(
+            'SELECT id, name, pin, role FROM employees WHERE is_active = TRUE ORDER BY name ASC'
+        );
+        res.json({ status: 'success', data: result.rows });
+    } catch (error) {
+        res.status(500).json({ status: 'error', message: error.message });
+    }
+});
+
+// 4. Endpoint Sinkronisasi Nota Jualan (Bills + Shift ID)
 app.post('/api/sync/bills', async (req, res) => {
     const client = await pool.connect();
     try {
@@ -47,13 +97,14 @@ app.post('/api/sync/bills', async (req, res) => {
         if (bills && bills.length > 0) {
             for (let bill of bills) {
                 await client.query(`
-                    INSERT INTO bills (id, customer_name, status, payment_method, created_at)
-                    VALUES ($1, $2, $3, $4, $5)
+                    INSERT INTO bills (id, customer_name, status, payment_method, created_at, shift_id)
+                    VALUES ($1, $2, $3, $4, $5, $6)
                     ON CONFLICT (id) DO UPDATE 
                     SET customer_name = EXCLUDED.customer_name,
                         status = EXCLUDED.status, 
-                        payment_method = EXCLUDED.payment_method
-                `, [bill.id, bill.customer_name, bill.status, bill.payment_method, bill.created_at]);
+                        payment_method = EXCLUDED.payment_method,
+                        shift_id = COALESCE(EXCLUDED.shift_id, bills.shift_id)
+                `, [bill.id, bill.customer_name, bill.status, bill.payment_method, bill.created_at, bill.shift_id || null]);
             }
         }
 
@@ -76,36 +127,35 @@ app.post('/api/sync/bills', async (req, res) => {
         res.json({ status: 'success', message: 'Data nota berhasil disinkronkan!' });
     } catch (error) {
         await client.query('ROLLBACK'); 
-        console.error('Sync Error:', error);
+        console.error('Sync Bills Error:', error);
         res.status(500).json({ status: 'error', message: error.message });
     } finally {
         client.release();
     }
 });
 
-// 4. Endpoint Sinkronisasi Pengeluaran (Expenses)
+// 5. Endpoint Sinkronisasi Pengeluaran (Expenses + Shift ID)
 app.post('/api/sync/expenses', async (req, res) => {
     const client = await pool.connect();
     try {
         await client.query('BEGIN');
         const { notes, items } = req.body;
 
-        // Simpan Kepala Nota Pengeluaran
         if (notes && notes.length > 0) {
             for (let note of notes) {
                 await client.query(`
-                    INSERT INTO expense_notes (id, type, description, amount, status, created_at)
-                    VALUES ($1, $2, $3, $4, $5, $6)
+                    INSERT INTO expense_notes (id, type, description, amount, status, created_at, shift_id)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7)
                     ON CONFLICT (id) DO UPDATE 
                     SET type = EXCLUDED.type,
                         description = EXCLUDED.description,
                         amount = EXCLUDED.amount,
-                        status = EXCLUDED.status
-                `, [note.id, note.type, note.description, note.amount, note.status, note.created_at]);
+                        status = EXCLUDED.status,
+                        shift_id = COALESCE(EXCLUDED.shift_id, expense_notes.shift_id)
+                `, [note.id, note.type, note.description, note.amount, note.status, note.created_at, note.shift_id || null]);
             }
         }
 
-        // Simpan Rincian Item PO Belanja
         if (items && items.length > 0) {
             for (let item of items) {
                 await client.query(`
@@ -124,6 +174,47 @@ app.post('/api/sync/expenses', async (req, res) => {
     } catch (error) {
         await client.query('ROLLBACK');
         console.error('Sync Expense Error:', error);
+        res.status(500).json({ status: 'error', message: error.message });
+    } finally {
+        client.release();
+    }
+});
+
+// 6. Endpoint Sinkronisasi Shift Kasir (Buka & Tutup Shift / Blind Closing)
+app.post('/api/sync/shifts', async (req, res) => {
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+        const { shifts } = req.body;
+
+        if (shifts && shifts.length > 0) {
+            for (let s of shifts) {
+                await client.query(`
+                    INSERT INTO cashier_shifts (
+                        id, employee_id, employee_name, cashier_slot, 
+                        opened_at, closed_at, opening_cash, expected_cash, 
+                        actual_cash, discrepancy, status
+                    )
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+                    ON CONFLICT (id) DO UPDATE 
+                    SET closed_at = EXCLUDED.closed_at,
+                        expected_cash = EXCLUDED.expected_cash,
+                        actual_cash = EXCLUDED.actual_cash,
+                        discrepancy = EXCLUDED.discrepancy,
+                        status = EXCLUDED.status
+                `, [
+                    s.id, s.employee_id, s.employee_name, s.cashier_slot,
+                    s.opened_at, s.closed_at || null, s.opening_cash, s.expected_cash,
+                    s.actual_cash, s.discrepancy, s.status
+                ]);
+            }
+        }
+
+        await client.query('COMMIT');
+        res.json({ status: 'success', message: 'Data shift berhasil disinkronkan!' });
+    } catch (error) {
+        await client.query('ROLLBACK');
+        console.error('Sync Shifts Error:', error);
         res.status(500).json({ status: 'error', message: error.message });
     } finally {
         client.release();
